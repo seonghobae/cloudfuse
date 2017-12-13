@@ -4,7 +4,6 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
 #ifdef __linux__
 #include <alloca.h>
 #endif
@@ -16,7 +15,6 @@
 #include <libxml/tree.h>
 #include <libxml/xpath.h>
 #include <libxml/xpathInternals.h>
-#include <json-c/json.h>
 #include "cloudfsapi.h"
 #include "config.h"
 
@@ -27,24 +25,12 @@
 
 static char storage_url[MAX_URL_SIZE];
 static char storage_token[MAX_HEADER_SIZE];
-static char storage_space_used[32];
 static pthread_mutex_t pool_mut;
 static CURL *curl_pool[1024];
 static int curl_pool_count = 0;
 static int debug = 0;
 static int verify_ssl = 1;
 static int rhel5_mode = 0;
-
-struct json_payload {
-  char *data;
-  size_t size;
-};
-
-struct json_element {
-  const char *e_key;
-  const char *e_subkey;
-  const char *e_subval;
-};
 
 #ifdef HAVE_OPENSSL
 #include <openssl/crypto.h>
@@ -63,59 +49,6 @@ static unsigned long thread_id()
 }
 #endif
 
-static json_object **get_elements_from_json(struct json_element *path, json_object *root)
-{
-  json_object *this_obj = root, *lookup_obj = NULL;
-  json_object **elements;
-  int i = 0, j, len;
-  int eid = 0, max_elements = 16;
-
-  elements = (json_object **) calloc(max_elements+1, sizeof(json_object *));
-  while (path[i].e_key)
-  {
-    if (json_object_object_get_ex(this_obj, path[i].e_key, &lookup_obj) == 0)
-    {
-      debugf("failed to find json element %s", path[i].e_key);
-      free(elements);
-      return NULL;
-    }
-    if (path[i].e_subkey && path[i].e_subval) // lookup_obj is an array
-    {
-      len = json_object_array_length(lookup_obj);
-      for (j=0; j<len; ++j)
-      {
-        json_object *child, *sub = json_object_array_get_idx(lookup_obj, j);
-	if (json_object_object_get_ex(sub, path[i].e_subkey, &child) == 0)
-        {
-          debugf("failed to find json element %s", path[i].e_subkey);
-          free(elements);
-          return NULL;
-        }
-        else if (!strcasecmp(path[i].e_subval, json_object_get_string(child)) ||
-                 path[i].e_subval[0] == '\0') // special case to guess region
-        {
-          this_obj = sub;
-          if (!path[i+1].e_key && eid < max_elements && j+1 < len)
-          {
-            elements[eid++] = sub;
-            continue;
-          }
-          i++;
-          break;
-        }
-      }
-    }
-    else
-    {
-      this_obj = lookup_obj;
-      i++;
-    }
-  }
-  if (eid == 0)
-    elements[0] = lookup_obj;
-  return elements;
-}
-
 static void rewrite_url_snet(char *url)
 {
   char protocol[MAX_URL_SIZE];
@@ -129,18 +62,6 @@ static size_t xml_dispatch(void *ptr, size_t size, size_t nmemb, void *stream)
 {
   xmlParseChunk((xmlParserCtxtPtr)stream, (char *)ptr, size * nmemb, 0);
   return size * nmemb;
-}
-
-static size_t json_dispatch(void *ptr, size_t size, size_t nmemb, void *stream)
-{
-  struct json_payload *payload = (struct json_payload *) stream;
-  size_t len = size * nmemb;
-
-  payload->data = (char *) realloc(payload->data, payload->size+len+1);
-  memcpy(&(payload->data[payload->size]), ptr, len);
-  payload->size += len;
-  payload->data[payload->size] = '\0';
-  return len;
 }
 
 static CURL *get_connection(const char *path)
@@ -169,26 +90,6 @@ static void add_header(curl_slist **headers, const char *name,
   char x_header[MAX_HEADER_SIZE];
   snprintf(x_header, sizeof(x_header), "%s: %s", name, value);
   *headers = curl_slist_append(*headers, x_header);
-}
-
-static size_t header_dispatch(void *ptr, size_t size, size_t nmemb, void *stream)
-{
-  char *header = (char *)alloca(size * nmemb + 1);
-  char *head = (char *)alloca(size * nmemb + 1);
-  char *value = (char *)alloca(size * nmemb + 1);
-  memcpy(header, (char *)ptr, size * nmemb);
-  header[size * nmemb] = '\0';
-  if (sscanf(header, "%[^:]: %[^\r\n]", head, value) == 2)
-  {
-    if (!strncasecmp(head, "x-auth-token", size * nmemb) ||
-        !strncasecmp(head, "x-subject-token", size * nmemb))
-      strncpy(storage_token, value, sizeof(storage_token));
-    if (!strncasecmp(head, "x-storage-url", size * nmemb))
-      strncpy(storage_url, value, sizeof(storage_url));
-    if (!strncasecmp(head, "x-account-bytes-used", size * nmemb))
-      strncpy(storage_space_used, value, sizeof(storage_space_used));
-  }
-  return size * nmemb;
 }
 
 static int send_request(char *method, const char *path, FILE *fp,
@@ -226,7 +127,6 @@ static int send_request(char *method, const char *path, FILE *fp,
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, verify_ssl);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, verify_ssl);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10);
     curl_easy_setopt(curl, CURLOPT_VERBOSE, debug);
@@ -263,11 +163,6 @@ static int send_request(char *method, const char *path, FILE *fp,
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &xml_dispatch);
       }
     }
-    else if (!strcasecmp(method, "HEAD"))
-    {
-      curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
-      curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &header_dispatch);
-    }
     else
       curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
     /* add the headers from extra_headers if any */
@@ -292,6 +187,147 @@ static int send_request(char *method, const char *path, FILE *fp,
       xmlCtxtResetPush(xmlctx, NULL, 0, NULL, NULL);
   }
   return response;
+}
+
+static size_t header_dispatch(void *ptr, size_t size, size_t nmemb, void *stream)
+{
+  char *header = (char *)alloca(size * nmemb + 1);
+  char *head = (char *)alloca(size * nmemb + 1);
+  char *value = (char *)alloca(size * nmemb + 1);
+  memcpy(header, (char *)ptr, size * nmemb);
+  header[size * nmemb] = '\0';
+  if (sscanf(header, "%[^:]: %[^\r\n]", head, value) == 2)
+  {
+    if (!strncasecmp(head, "x-auth-token", size * nmemb))
+      strncpy(storage_token, value, sizeof(storage_token));
+    if (!strncasecmp(head, "x-storage-url", size * nmemb))
+      strncpy(storage_url, value, sizeof(storage_url));
+  }
+  return size * nmemb;
+}
+
+static void prepare_list_request(const char *path, char *container, 
+                                        int *prefix_length, char *last)
+{
+  char object[MAX_PATH_SIZE] = "";
+
+  if (!strcmp(path, "") || !strcmp(path, "/"))
+  {
+    path = "";
+    sprintf(container, "/?format=xml");
+    if (!strcmp(path, ""))
+      strncat(container, last, strlen(last));
+  }
+  else
+  {
+    sscanf(path, "/%[^/]/%[^\n]", container, object);
+    
+    char *encoded_container = curl_escape(container, 0);
+    char *encoded_object = curl_escape(object, 0);
+
+    // The empty path doesn't get a trailing slash, everything else does
+    char *trailing_slash;
+    *prefix_length = strlen(object);
+    if (object[0] == 0)
+      trailing_slash = "";
+    else
+    {
+      trailing_slash = "/";
+      (*prefix_length)++;
+    }
+    
+    snprintf(container, MAX_PATH_SIZE * 3, "%s?format=xml&delimiter=/&prefix=%s%s",
+              encoded_container, encoded_object, trailing_slash);
+    strncat(container, last, strlen(last));
+
+    curl_free(encoded_container);
+    curl_free(encoded_object);
+  }
+}
+
+static int parse_list_response(const char *path, int prefix_length, 
+                                xmlParserCtxtPtr xmlctx, dir_entry **dir_list)
+{
+  char last_subdir[MAX_PATH_SIZE] = "";
+  xmlNode *onode = NULL, *anode = NULL, *text_node = NULL;
+
+  int entry_count = 0;
+
+  xmlNode *root_element = xmlDocGetRootElement(xmlctx->myDoc);
+  for (onode = root_element->children; onode; onode = onode->next)
+  {
+    if (onode->type != XML_ELEMENT_NODE) continue;
+
+    char is_object = !strcasecmp((const char *)onode->name, "object");
+    char is_container = !strcasecmp((const char *)onode->name, "container");
+    char is_subdir = !strcasecmp((const char *)onode->name, "subdir");
+
+    if (is_object || is_container || is_subdir)
+    {
+      entry_count++;
+
+      dir_entry *de = (dir_entry *)malloc(sizeof(dir_entry));
+      de->next = NULL;
+      de->size = 0;
+      de->last_modified = time(NULL);
+      if (is_container || is_subdir)
+        de->content_type = strdup("application/directory");
+      for (anode = onode->children; anode; anode = anode->next)
+      {
+        char *content = "<?!?>";
+        for (text_node = anode->children; text_node; text_node = text_node->next)
+          if (text_node->type == XML_TEXT_NODE)
+            content = (char *)text_node->content;
+        if (!strcasecmp((const char *)anode->name, "name"))
+        {
+          de->name = strdup(content + prefix_length);
+
+          // Remove trailing slash
+          char *slash = strrchr(de->name, '/');
+          if (slash && (0 == *(slash + 1)))
+            *slash = 0;
+
+          if (asprintf(&(de->full_name), "%s/%s", path, de->name) < 0)
+            de->full_name = NULL;
+        }
+        if (!strcasecmp((const char *)anode->name, "bytes"))
+          de->size = strtoll(content, NULL, 10);
+        if (!strcasecmp((const char *)anode->name, "content_type"))
+        {
+          de->content_type = strdup(content);
+          char *semicolon = strchr(de->content_type, ';');
+          if (semicolon)
+            *semicolon = '\0';
+        }
+        if (!strcasecmp((const char *)anode->name, "last_modified"))
+        {
+          struct tm last_modified;
+          strptime(content, "%FT%T", &last_modified);
+          de->last_modified = mktime(&last_modified);
+        }
+      }
+      de->isdir = de->content_type &&
+          ((strstr(de->content_type, "application/folder") != NULL) ||
+           (strstr(de->content_type, "application/directory") != NULL));
+      if (de->isdir)
+      {
+        if (!strncasecmp(de->name, last_subdir, sizeof(last_subdir)))
+        {
+          cloudfs_free_dir_list(de);
+          continue;
+        }
+        strncpy(last_subdir, de->name, sizeof(last_subdir));
+      }
+      de->next = *dir_list;
+      *dir_list = de;
+    }
+    else
+    {
+      debugf("unknown element: %s", onode->name);
+    }
+  }
+
+  return entry_count;
 }
 
 /*
@@ -330,18 +366,6 @@ void cloudfs_init()
     // allow https to continue working after forking (for RHEL/CentOS 6)
     setenv("NSS_STRICT_NOFORK", "DISABLED", 1);
   }
-}
-
-int cloudfs_tenant_info(struct statvfs *stat)
-{
-  int response = send_request("HEAD", "", NULL, NULL, NULL);
-  if (response == 204)
-  {
-    fsblkcnt_t space_used = atol(storage_space_used) / stat->f_frsize;
-    stat->f_bfree = stat->f_bavail = stat->f_blocks - space_used;
-    return 1;
-  }
-  return 0;
 }
 
 int cloudfs_object_read_fp(const char *path, FILE *fp)
@@ -387,128 +411,52 @@ int cloudfs_object_truncate(const char *path, off_t size)
 int cloudfs_list_directory(const char *path, dir_entry **dir_list)
 {
   char container[MAX_PATH_SIZE * 3] = "";
-  char object[MAX_PATH_SIZE] = "";
-  char last_subdir[MAX_PATH_SIZE] = "";
-  int prefix_length = 0;
+  char *marker;
+  char last[NAME_MAX + 25] = "";
+
+  xmlParserCtxtPtr xmlctx;
+
   int response = 0;
   int retval = 0;
+  int prefix_length = 0;
+  int is_last = 0;
   int entry_count = 0;
 
   *dir_list = NULL;
-  xmlNode *onode = NULL, *anode = NULL, *text_node = NULL;
-  xmlParserCtxtPtr xmlctx = xmlCreatePushParserCtxt(NULL, NULL, "", 0, NULL);
-  if (!strcmp(path, "") || !strcmp(path, "/"))
-  {
-    path = "";
-    strncpy(container, "/?format=xml", sizeof(container));
-  }
-  else
-  {
-    sscanf(path, "/%[^/]/%[^\n]", container, object);
-    char *encoded_container = curl_escape(container, 0);
-    char *encoded_object = curl_escape(object, 0);
 
-    // The empty path doesn't get a trailing slash, everything else does
-    char *trailing_slash;
-    prefix_length = strlen(object);
-    if (object[0] == 0)
-      trailing_slash = "";
+  while (is_last == 0) 
+  { 
+    xmlctx = xmlCreatePushParserCtxt(NULL, NULL, "", 0, NULL);
+
+    if (marker != NULL)
+        snprintf(last, sizeof(last), "&marker=%s&limit=%d", marker, DIR_LIST_LIMIT);
     else
-    {
-      trailing_slash = "/";
-      prefix_length++;
-    }
+        snprintf(last, sizeof(last), "&limit=%d", DIR_LIST_LIMIT);
 
-    snprintf(container, sizeof(container), "%s?format=xml&delimiter=/&prefix=%s%s",
-              encoded_container, encoded_object, trailing_slash);
-    curl_free(encoded_container);
-    curl_free(encoded_object);
+    prepare_list_request(path, container, &prefix_length, last);
+    response = send_request("GET", container, NULL, xmlctx, NULL);
+  
+    xmlParseChunk(xmlctx, "", 0, 1);
+    if (xmlctx->wellFormed && response >= 200 && response < 300)
+    {
+      entry_count = parse_list_response(path, prefix_length, xmlctx, dir_list);
+      if (entry_count < DIR_LIST_LIMIT)
+        is_last = 1;
+      else if (entry_count >= DIR_LIST_LIMIT)
+      { 
+         dir_entry *de = *dir_list;
+         marker = de->name;
+      }
+      
+      retval = 1;
+    } 
+    else 
+      is_last = 1;
+
+    xmlFreeDoc(xmlctx->myDoc);
+    xmlFreeParserCtxt(xmlctx);
   }
 
-  response = send_request("GET", container, NULL, xmlctx, NULL);
-  xmlParseChunk(xmlctx, "", 0, 1);
-  if (xmlctx->wellFormed && response >= 200 && response < 300)
-  {
-    xmlNode *root_element = xmlDocGetRootElement(xmlctx->myDoc);
-    for (onode = root_element->children; onode; onode = onode->next)
-    {
-      if (onode->type != XML_ELEMENT_NODE) continue;
-
-      char is_object = !strcasecmp((const char *)onode->name, "object");
-      char is_container = !strcasecmp((const char *)onode->name, "container");
-      char is_subdir = !strcasecmp((const char *)onode->name, "subdir");
-
-      if (is_object || is_container || is_subdir)
-      {
-        entry_count++;
-
-        dir_entry *de = (dir_entry *)malloc(sizeof(dir_entry));
-        de->next = NULL;
-        de->size = 0;
-        de->last_modified = time(NULL);
-        if (is_container || is_subdir)
-          de->content_type = strdup("application/directory");
-        for (anode = onode->children; anode; anode = anode->next)
-        {
-          char *content = "<?!?>";
-          for (text_node = anode->children; text_node; text_node = text_node->next)
-            if (text_node->type == XML_TEXT_NODE)
-              content = (char *)text_node->content;
-          if (!strcasecmp((const char *)anode->name, "name"))
-          {
-            de->name = strdup(content + prefix_length);
-
-            // Remove trailing slash
-            char *slash = strrchr(de->name, '/');
-            if (slash && (0 == *(slash + 1)))
-              *slash = 0;
-
-            if (asprintf(&(de->full_name), "%s/%s", path, de->name) < 0)
-              de->full_name = NULL;
-          }
-          if (!strcasecmp((const char *)anode->name, "bytes"))
-            de->size = strtoll(content, NULL, 10);
-          if (!strcasecmp((const char *)anode->name, "content_type"))
-          {
-            de->content_type = strdup(content);
-            char *semicolon = strchr(de->content_type, ';');
-            if (semicolon)
-              *semicolon = '\0';
-          }
-          if (!strcasecmp((const char *)anode->name, "last_modified"))
-          {
-            struct tm last_modified;
-            strptime(content, "%FT%T", &last_modified);
-            de->last_modified = mktime(&last_modified);
-          }
-        }
-        de->isdir = de->content_type &&
-            ((strstr(de->content_type, "application/folder") != NULL) ||
-             (strstr(de->content_type, "application/directory") != NULL));
-        if (de->isdir)
-        {
-          if (!strncasecmp(de->name, last_subdir, sizeof(last_subdir)))
-          {
-            cloudfs_free_dir_list(de);
-            continue;
-          }
-          strncpy(last_subdir, de->name, sizeof(last_subdir));
-        }
-        de->next = *dir_list;
-        *dir_list = de;
-      }
-      else
-      {
-        debugf("unknown element: %s", onode->name);
-      }
-    }
-    retval = 1;
-  }
-
-  debugf("entry count: %d", entry_count);
-
-  xmlFreeDoc(xmlctx->myDoc);
-  xmlFreeParserCtxt(xmlctx);
   return retval;
 }
 
@@ -592,14 +540,6 @@ void cloudfs_set_credentials(char *username, char *tenant, char *password,
     else if (!strcmp(authurl + strlen(authurl) - 6, "/v2.0/"))
       strcat(reconnect_args.authurl, "tokens");
   }
-  else if (strstr(authurl, "v3"))
-  {
-    reconnect_args.auth_version = 3;
-    if (!strcmp(authurl + strlen(authurl) - 3, "/v3"))
-      strcat(reconnect_args.authurl, "/auth/tokens");
-    else if (!strcmp(authurl + strlen(authurl) - 4, "/v3/"))
-      strcat(reconnect_args.authurl, "auth/tokens");
-  }
   else
     reconnect_args.auth_version = 1;
   reconnect_args.use_snet = use_snet;
@@ -611,9 +551,8 @@ int cloudfs_connect()
   curl_slist *headers = NULL;
   CURL *curl = curl_easy_init();
   char postdata[8192] = "";
-  enum json_tokener_error json_err = json_tokener_success;
-  struct json_payload *json_payload = NULL;
-  json_object *json = NULL;
+  xmlNode *top_node = NULL, *service_node = NULL, *endpoint_node = NULL;
+  xmlParserCtxtPtr xmlctx = NULL;
 
   pthread_mutex_lock(&pool_mut);
 
@@ -621,58 +560,38 @@ int cloudfs_connect()
 
   if (reconnect_args.auth_version == 2)
   {
-    if (!reconnect_args.tenant[0]) {
-      snprintf(postdata, sizeof(postdata), "{\"auth\":{\"RAX-KSKEY:apiKeyCre"
-        "dentials\":{\"username\":\"%s\",\"apiKey\":\"%s\"}}}",
-        reconnect_args.username, reconnect_args.password);
-    } else {
-      snprintf(postdata, sizeof(postdata), "{\"auth\":{\"tenantName\":\"%s\","
-        "\"passwordCredentials\":{\"username\":\"%s\",\"password\":\"%s\"}}}",
-        reconnect_args.tenant, reconnect_args.username,
-        reconnect_args.password);
-    }
-    debugf("%s", postdata);
-
-    add_header(&headers, "Content-Type", "application/json");
-    add_header(&headers, "Accept", "application/json");
-
-    curl_easy_setopt(curl, CURLOPT_POST, 1);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postdata);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(postdata));
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &header_dispatch);
-    json_payload = (struct json_payload *) calloc(1, sizeof(struct json_payload));
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, json_payload);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &json_dispatch);
-  }
-  else if (reconnect_args.auth_version == 3)
-  {
     if (reconnect_args.username[0] && reconnect_args.tenant[0] && reconnect_args.password[0])
     {
-      snprintf(postdata, sizeof(postdata), "{\"auth\":{\"identity\":{"
-          "\"methods\":[\"password\"],\"password\":{\"user\":{\"id\":"
-          "\"%s\",\"password\":\"%s\"}},\"scope\":{\"project\":{\"id"
-          "\":\"%s\"}}}}}", reconnect_args.username, reconnect_args.password,
-          reconnect_args.tenant);
+      snprintf(postdata, sizeof(postdata), "<?xml version=\"1.0\" encoding"
+          "=\"UTF-8\"?><auth xmlns=\"http://docs.openstack.org/identity/ap"
+          "i/v2.0\" tenantName=\"%s\"><passwordCredentials username=\"%s\""
+          " password=\"%s\"/></auth>", reconnect_args.tenant,
+          reconnect_args.username, reconnect_args.password);
     }
     else if (reconnect_args.username[0] && reconnect_args.password[0])
     {
-      snprintf(postdata, sizeof(postdata), "{\"auth\":{\"identity\":{"
-          "\"methods\":[\"password\"],\"password\":{\"user\":{\"id\":"
-          "\"%s\",\"password\":\"%s\"}}}}}", reconnect_args.username,
-          reconnect_args.password);
+      snprintf(postdata, sizeof(postdata), "<?xml version=\"1.0\" encoding"
+          "=\"UTF-8\"?><auth><apiKeyCredentials xmlns=\"http://docs.racksp"
+          "ace.com/identity/api/ext/RAX-KSKEY/v1.0\" username=\"%s\" apiKe"
+          "y=\"%s\"/></auth>", reconnect_args.username, reconnect_args.password);
+    }
+    else
+    {
+      debugf("Unable to determine auth scheme.");
+      abort();
     }
     debugf("%s", postdata);
-    add_header(&headers, "Content-Type", "application/json");
+
+    add_header(&headers, "Content-Type", "application/xml");
+    add_header(&headers, "Accept", "application/xml");
 
     curl_easy_setopt(curl, CURLOPT_POST, 1);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postdata);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(postdata));
 
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &header_dispatch);
-
-    json_payload = (struct json_payload *) calloc(1, sizeof(struct json_payload));
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, json_payload);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &json_dispatch);
+    xmlctx = xmlCreatePushParserCtxt(NULL, NULL, "", 0, NULL);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, xmlctx);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &xml_dispatch);
   }
   else
   {
@@ -698,128 +617,70 @@ int cloudfs_connect()
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
 
-  if (reconnect_args.auth_version == 2 && json_payload)
+  if (reconnect_args.auth_version == 2)
   {
-    json = json_tokener_parse_verbose(json_payload->data, &json_err);
-    free(json_payload->data);
-    free(json_payload);
-    if (!reconnect_args.region[0])
+    xmlParseChunk(xmlctx, "", 0, 1);
+    if (xmlctx->wellFormed && response >= 200 && response < 300)
     {
-      json_object *access, *user, *default_region;
-      if (json_object_object_get_ex(json, "access", &access) &&
-          json_object_object_get_ex(access, "user", &user) &&
-          json_object_object_get_ex(user, "RAX-AUTH:defaultRegion", &default_region))
+      xmlXPathContextPtr xpctx = xmlXPathNewContext(xmlctx->myDoc);
+      xmlXPathRegisterNs(xpctx, "id", "http://docs.openstack.org/identity/api/v2.0");
+      xmlXPathObjectPtr obj;
+
+      /* Determine default region if not configured */
+      if (!reconnect_args.region[0])
       {
-        strncpy(reconnect_args.region, json_object_get_string(default_region), sizeof(reconnect_args.region));
-      }
-    }
-    json_object *access, *service_catalog, *token, *id;
-    if (json_object_object_get_ex(json, "access", &access) &&
-        json_object_object_get_ex(access, "token", &token) &&
-        json_object_object_get_ex(token, "id", &id))
-    {
-      strncpy(storage_token, json_object_get_string(id), sizeof(storage_token));
-    }
-    if (json_object_object_get_ex(json, "access", &access) &&
-        json_object_object_get_ex(access, "serviceCatalog", &service_catalog))
-    {
-      int i, entries = json_object_array_length(service_catalog);
-      for (i = 0; i < entries; i++)
-      {
-        json_object *type, *catalog_entry = json_object_array_get_idx(service_catalog, i);
-        if (json_object_object_get_ex(catalog_entry, "type", &type))
+        obj = xmlXPathEval("/id:access/id:user", xpctx);
+        if (obj && obj->nodesetval && obj->nodesetval->nodeNr > 0)
         {
-          const char *type_name = json_object_get_string(type);
-          if (!strcmp(type_name, "object-store"))
+          xmlChar *default_region = xmlGetProp(obj->nodesetval->nodeTab[0], "defaultRegion");
+          if (default_region && *default_region)
           {
-            json_object *endpoints;
-            if (json_object_object_get_ex(catalog_entry, "endpoints", &endpoints))
-            {
-              int i, entries = json_object_array_length(endpoints);
-              for (i = 0; i < entries; i++)
-              {
-                json_object *url, *region, *endpoint = json_object_array_get_idx(endpoints, i);
-                if (json_object_object_get_ex(endpoint, "region", &region))
-                {
-                  const char *region_name = json_object_get_string(region);
-                  if (reconnect_args.region[0] == 0 ||
-                      !strncmp(region_name, reconnect_args.region, sizeof(reconnect_args.region)))
-                  {
-                    if (reconnect_args.use_snet &&
-                        json_object_object_get_ex(endpoint, "internalURL", &url))
-                    {
-                      strncpy(storage_url, json_object_get_string(url), sizeof(storage_url));
-                    } else if (json_object_object_get_ex(endpoint, "publicURL", &url)) {
-                      strncpy(storage_url, json_object_get_string(url), sizeof(storage_url));
-                    }
-                  }
-                }
-              }
-              if (strlen(storage_url) == 0)
-              {
-                debugf("Unable to find endpoint for region: %s", reconnect_args.region);
-                for (i = 0; i < entries; i++)
-                {
-                  json_object *region, *endpoint = json_object_array_get_idx(endpoints, i);
-                  if (json_object_object_get_ex(endpoint, "region", &region))
-                  {
-                    const char *region_name = json_object_get_string(region);
-                    debugf("valid region: %s", region_name);
-                  }
-                }
-              }
-            }
+            strncpy(reconnect_args.region, default_region, sizeof(reconnect_args.region));
+            xmlFree(default_region);
           }
         }
+        xmlXPathFreeNodeSetList(obj);
       }
-    }
-    json_object_put(json);
-    debugf("storage_url: %s", storage_url);
-    debugf("storage_token: %s", storage_token);
-  }
-  else if (reconnect_args.auth_version == 3)
-  {
-    if (json_payload)
-    {
-      json = json_tokener_parse_verbose(json_payload->data, &json_err);
-      free(json_payload->data);
-      free(json_payload);
-      if (json_err != json_tokener_success)
-        debugf("failed parsing the JSON stream");
+      debugf("Using region: %s", reconnect_args.region);
+
+      if (reconnect_args.region[0])
+      {
+        char path[1024];
+        snprintf(path, sizeof(path), "/id:access/id:serviceCatalog/id:service"
+            "[@type='object-store']/id:endpoint[@region='%s']",
+            reconnect_args.region);
+        obj = xmlXPathEval(path, xpctx);
+      }
       else
+        obj = xmlXPathEval("/id:access/id:serviceCatalog/id:service"
+            "[@type='object-store']/id:endpoint", xpctx);
+      if (obj->nodesetval && obj->nodesetval->nodeNr > 0)
       {
-        struct json_element path[] = {
-          { .e_key="token" },
-          { .e_key="catalog", .e_subkey="type", .e_subval="object-store" },
-          { .e_key="endpoints", .e_subkey="region_id", .e_subval=reconnect_args.region },
-          { .e_key=NULL }
-        };
-        json_object **ep = get_elements_from_json(path, json);
-        if (ep)
-        {
-          int ep_id;
-          char is_public, is_internal;
-          char wants_internal = reconnect_args.use_snet;
-          for (ep_id=0; ep[ep_id]; ++ep_id)
-          {
-            json_object *interface = NULL, *url = NULL;
-            json_object_object_get_ex(ep[ep_id], "url", &url);
-            json_object_object_get_ex(ep[ep_id], "interface", &interface);
-            is_internal = strcasecmp(json_object_get_string(interface), "internal") == 0;
-            is_public = is_internal ? 0 : strcasecmp(json_object_get_string(interface), "public") == 0;
-            if ((wants_internal && is_internal) || (!wants_internal && is_public))
-            {
-              strncpy(storage_url, json_object_get_string(url), sizeof(storage_url));
-              break;
-            }
-          }
-          free(ep);
-        }
+        xmlChar *url;
+        if (reconnect_args.use_snet)
+          url = xmlGetProp(obj->nodesetval->nodeTab[0], "internalURL");
+        else
+          url = xmlGetProp(obj->nodesetval->nodeTab[0], "publicURL");
+        strncpy(storage_url, url, sizeof(storage_url));
+        xmlFree(url);
       }
-      json_object_put(json);
+      else
+        debugf("Unable to find endpoint");
+      xmlXPathFreeNodeSetList(obj);
+
+      obj = xmlXPathEval("/id:access/id:token", xpctx);
+      if (obj->nodesetval && obj->nodesetval->nodeNr > 0)
+      {
+        xmlChar *token_id = xmlGetProp(obj->nodesetval->nodeTab[0], "id");
+        strncpy(storage_token, token_id, sizeof(storage_token));
+        xmlFree(token_id);
+      }
+      xmlXPathFreeNodeSetList(obj);
+      xmlXPathFreeContext(xpctx);
       debugf("storage_url: %s", storage_url);
       debugf("storage_token: %s", storage_token);
     }
+    xmlFreeParserCtxt(xmlctx);
   }
   else if (reconnect_args.use_snet && storage_url[0])
     rewrite_url_snet(storage_url);
@@ -839,4 +700,3 @@ void debugf(char *fmt, ...)
     putc('\n', stderr);
   }
 }
-
