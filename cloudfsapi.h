@@ -9,6 +9,8 @@
 #define MAX_PATH_SIZE (1024 + 256 + 3)
 #define MAX_URL_SIZE (MAX_PATH_SIZE * 3)
 #define USER_AGENT "CloudFuse"
+#define NAME_MAX 255
+#define DIR_LIST_LIMIT 5000
 
 typedef struct curl_slist curl_slist;
 
@@ -26,8 +28,7 @@ typedef struct dir_entry
 void cloudfs_init();
 void cloudfs_set_credentials(char *username, char *tenant, char *password,
                              char *authurl, char *region, int use_snet);
-int cloudfs_connect();
-int cloudfs_tenant_info(struct statvfs *stat);
+int cloufds_connect();
 int cloudfs_object_read_fp(const char *path, FILE *fp);
 int cloudfs_object_write_fp(const char *path, FILE *fp);
 int cloudfs_list_directory(const char *path, dir_entry **);
@@ -42,4 +43,3 @@ void cloudfs_free_dir_list(dir_entry *dir_list);
 
 void debugf(char *fmt, ...);
 #endif
-
